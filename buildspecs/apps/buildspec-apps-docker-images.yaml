@@ -1,0 +1,71 @@
+version: 0.2
+
+#env:
+#  variables:
+#    JAVA_HOME: "/usr/lib/jvm/java-11-openjdk-amd64"
+
+phases:
+  install:
+    runtime-versions:
+      docker: 18
+      python: 3.8
+      java: openjdk11
+    commands:
+      - # Install jq 1.6
+      - wget -O /usr/bin/jq https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 && chmod 755 /usr/bin/jq
+      - # Install Maven
+      - apt-get update -y
+      - apt-get install -y maven
+  pre_build:
+    commands:
+      - pwd && ls -ltra && env # Useful for debugging
+      # - aws --version
+      - $(aws ecr get-login --no-include-email)
+      - APP_DIR=$CODEBUILD_SRC_DIR_App
+      - CODEPIPELINE_EXECUTION_ID=$(aws codepipeline get-pipeline-state --region $AWS_DEFAULT_REGION --name $PIPELINE_NAME --query 'stageStates[?actionStates[?latestExecution.externalExecutionId==`'${CODEBUILD_BUILD_ID}'`]].latestExecution.pipelineExecutionId' --output text)
+      - echo CODEPIPELINE_EXECUTION_ID=$CODEPIPELINE_EXECUTION_ID
+      - PIPELINE_EXECUTIONS=$(aws codepipeline list-pipeline-executions --pipeline-name $PIPELINE_NAME --query 'pipelineExecutionSummaries[?pipelineExecutionId==`'${CODEPIPELINE_EXECUTION_ID}'`]')
+      - echo $PIPELINE_EXECUTIONS
+      - APP_COMMIT=$(echo $PIPELINE_EXECUTIONS | tr '\r\n' ' ' | jq '.[].sourceRevisions[] | select(.actionName=="App").revisionId' --raw-output)
+      - INFRA_COMMIT=$(echo $PIPELINE_EXECUTIONS | tr '\r\n' ' ' | jq '.[].sourceRevisions[] | select(.actionName=="Infra").revisionId' --raw-output)
+      - VERSION_ID=v_$(echo $APP_COMMIT | cut -c 1-7)
+      - IMAGE_TAG=$VERSION_ID
+      - ls -ltra /root
+      - ls -ltra /root/.m2 || echo no /root/.m2 directory found
+      - ls -ltra /root/.m2/repository || echo no /root/.m2/repository directory found
+      - env # Used for debugging
+  build:
+    commands:
+      - python $CODEBUILD_SRC_DIR/buildspecs/pull_request.py statuses AppBuild pending "Builds docker images." codebuild_url
+      - # App Docker Image
+      - docker pull $ECR/default:latest || true
+      - cd $APP_DIR && mvn clean package
+      - cd $APP_DIR && docker build --cache-from $ECR/default:latest -t $ECR/default:latest .
+      - date
+      - # End
+  post_build:
+    commands:
+      - |-
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "0" ]; then
+          echo "CodeBuild job failed"
+        else
+          # Add more tags and push the App image.
+          docker tag $ECR/default:latest $ECR/default:latest
+          docker tag $ECR/default:latest $ECR/default:$IMAGE_TAG
+          docker tag $ECR/default:latest $ECR/default:$APP_COMMIT
+          docker push $ECR/default:latest
+          docker push $ECR/default:$IMAGE_TAG
+          docker push $ECR/default:$APP_COMMIT
+          date
+        fi
+      - # Save the image tag to a file to be exported as an artifact to be imported later by a CloudFormation stack action in the pipeline.
+      - printf '{"ImageTag":"%s", "AppCommit":"%s", "InfraCommit":"%s", "CodePipelineExecutionId":"%s"}\n' $IMAGE_TAG $APP_COMMIT $INFRA_COMMIT $CODEPIPELINE_EXECUTION_ID > $CODEBUILD_SRC_DIR/app_docker_images_output.json
+      - python $CODEBUILD_SRC_DIR/buildspecs/pull_request.py statuses AppBuild completed "Builds web bundle and docker images." codebuild_url
+      - # End
+artifacts:
+  files:
+    - app_docker_images_output.json
+    - templates/apps/template-*.yaml
+cache:
+  paths:
+    - '/root/.m2/**/*'

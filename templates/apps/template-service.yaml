@@ -1,0 +1,325 @@
+Description: >
+  Deploys a demo ECS service.
+
+Parameters:
+  DashCaseProjectName:
+    Description: The project name in hyphen-case.
+    Type: String
+
+  Domain:
+    Description: The domain.
+    Type: String
+
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+
+  Namespace:
+    Description: The namespace used for service discovery.
+    Type: String
+
+  InfraGitBranch:
+    Description: The infrastructure repo github branch that feeds into this pipeline.
+    Type: String
+
+  AppGitBranch:
+    Description: The git branch of the repo.
+    Type: String
+
+  ImageTag:
+    Description: The image tag of the docker image that will be deployed to the service.
+    Type: String
+
+  AppCommit:
+    Description: The git commit of the repo used to build docker images associated with this stack (source code copied into container(s)).
+    Type: String
+
+  InfraCommit:
+    Description: The git commit of the infrastructure repo used to build docker images associated with this stack (dockerfiles used to build container(s)).
+    Type: String
+    Default: 'unused'
+
+  CodePipelineExecutionId:
+    Description: The code pipeline execution id of the code pipeline run associated with this stack deployment.
+    Type: String
+    Default: 'unused'
+
+  HostHeader:
+    Description: The host header to register with the Application Load Balancer.
+    Type: String
+    Default: ""
+
+  TaskDeregistrationDelaySeconds:
+    Description: The amount of time for Elastic Load Balancing to wait before deregistering a target/task. The range is 0–3600 seconds. The default value is 300 seconds. If this number is too large then blue/green deploys take longer.
+    Type: String
+
+  PullRequestNumber:
+    Description: (Optional) GitHub pull request number if this pipeline was created from a pull request. Usually a the GitHub Lambda webhook handler will set this parameter.
+    Type: String
+    Default: ""
+
+Conditions:
+  IsMasterBranch:
+    !Equals [!Ref AppGitBranch, master]
+  HasHostHeader:
+    !Not [!Equals [!Ref HostHeader, ""]]
+  HasPullRequestNumber:
+    !Not [!Equals [!Ref PullRequestNumber, ""]]
+
+Resources:
+  ### ==================================
+  ### {AppGitBranch}.test
+  ### ==================================
+  ServiceDiscoveryRecordWeb:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: !Sub ${AppGitBranch}-web
+      DnsConfig:
+        NamespaceId:
+          Fn::ImportValue: !Sub "DNS::${Namespace}::NamespaceId"
+        DnsRecords:
+          - Type: A
+            TTL: 15
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  ServiceWeb:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster:
+        Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::Cluster
+      ServiceName: !If
+        - HasPullRequestNumber
+        - !Sub ${DashCaseProjectName}-${Namespace}-pr-${PullRequestNumber}-web
+        - !Sub ${DashCaseProjectName}-${Namespace}-${AppGitBranch}-web
+      DesiredCount: !If
+        - IsMasterBranch
+        - 2
+        - 1
+      HealthCheckGracePeriodSeconds: 0
+      PlacementConstraints:
+        # Use distinctInstance to ensure that each task in a particular group is running on a different container instance.
+        - Type: distinctInstance
+      TaskDefinition: !Ref TaskDefinitionWeb
+      # See https://aws.amazon.com/cloud-map
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ServiceDiscoveryRecordWeb.Arn
+      LoadBalancers:
+        - ContainerName: web
+          # The port number on the container to direct load balancer traffic to. Your container instances must allow ingress traffic on this port.
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::ECSHostSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1
+            - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2
+
+  TaskDefinitionWeb:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-web
+      NetworkMode: awsvpc
+      TaskRoleArn:
+        Fn::ImportValue: !Sub ${DashCaseProjectName}-role-ecs-task-execution
+      ContainerDefinitions:
+        - Name: web
+          # Essential containers are required to start/run, else we mark the task as failed.
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/default:${ImageTag}
+          PortMappings:
+            - ContainerPort: 8080
+          MemoryReservation: !If
+            - IsMasterBranch
+            - 1024
+            - 512
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: web
+          Environment:
+            - Name: ENVIRONMENT_NAME
+              Value: !Sub ${EnvironmentName}
+            - Name: NAMESPACE
+              Value: !Sub ${Namespace}
+            - Name: INFRA_GIT_BRANCH
+              Value: !Sub ${InfraGitBranch}
+            - Name: GIT_BRANCH
+              Value: !Sub ${AppGitBranch}
+            - Name: IMAGE_TAG
+              Value: !Sub ${ImageTag}
+            - Name: APP_COMMIT
+              Value: !Sub ${AppCommit}
+            - Name: INFRA_COMMIT
+              Value: !Sub ${InfraCommit}
+            - Name: CODE_PIPELINE_EXECUTION_ID
+              Value: !Sub ${CodePipelineExecutionId}
+            - Name: CONTAINER_NAME
+              Value: web
+            - Name: AWS_DEFAULT_REGION
+              Value: !Sub ${AWS::Region}
+
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub ${AWS::StackName}
+      # How long to keep logs before deleting them in CloudWatch?
+      RetentionInDays: 365
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # If this is a pull request, allow dynamically reassociating the TG with a new ALB.
+      # This avoids the 'the following target groups cannot be associated with more than one load balancer' issue
+      # if we try to update this stack with a different load balancer.
+      Name: !If
+        - HasPullRequestNumber
+        - !Join
+          - '-'
+          - - 'pr'
+            - !Ref PullRequestNumber
+            - Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::LoadBalancerUniqueID
+        - !Ref 'AWS::NoValue'
+      VpcId:
+        Fn::ImportValue: !Sub "${EnvironmentName}-VPC"
+      # The port on which the targets receive traffic. This is usually port 80.
+      Port: 80
+      Protocol: HTTP
+      Matcher:
+        HttpCode: 200
+      HealthCheckIntervalSeconds: 60
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      # The number of seconds to wait for a response before considering that a health check has failed. For Application Load Balancers, the range is 2–60 seconds and the default is 5 seconds.
+      HealthCheckTimeoutSeconds: 10
+      # The number of consecutive successful health checks that are required before an unhealthy target is considered healthy.
+      HealthyThresholdCount: 5
+      # ip is used for ECS targets, instance is used for EC2 instances.
+      TargetType: ip
+      # How many seconds do we want to drain the task before stopping it? This number can be lower for test environments.
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: !Ref TaskDeregistrationDelaySeconds
+
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::ALBListener
+      Priority: !GetAtt ALBRulePriorityCustomResource.Priority # This gets set in the alb_rule_priority Lambda function.
+      Conditions:
+        - !If
+          - HasHostHeader
+          - Field: host-header
+            Values:
+              - !Sub ${Namespace}.${HostHeader}
+          - Field: host-header
+            Values:
+              - !Sub ${AppCommit}.${Namespace}.${Domain}
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+
+  DemoListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasPullRequestNumber
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::ALBListener
+      Priority: !GetAtt DemoALBRulePriorityCustomResource.Priority # This gets set in the alb_rule_priority Lambda function.
+      Conditions:
+        - Field: host-header
+          Values:
+            - !Sub web-pr-${PullRequestNumber}.${Namespace}.${Domain}
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+
+  ALBRecordSet:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      Comment: Web application load balancer endpoint.
+      HostedZoneId:
+        Fn::ImportValue: !Sub DNS::${Namespace}::PublicHostedZoneId
+      RecordSets:
+        - AliasTarget:
+            DNSName:
+              Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::LoadBalancerUrl
+            HostedZoneId:
+              Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::LoadBalancerCanonicalHostedZoneID
+          Name: !If
+            - HasHostHeader
+            - !Sub ${Namespace}.${HostHeader}
+            - !Sub ${AppCommit}.${Namespace}.${Domain}
+          Type: A
+
+  PullRequestALBRecordSet:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HasPullRequestNumber
+    Properties:
+      Comment: Web application load balancer endpoint.
+      HostedZoneId:
+        Fn::ImportValue: !Sub DNS::${Namespace}::PublicHostedZoneId
+      RecordSets:
+        - AliasTarget:
+            DNSName:
+              Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::LoadBalancerUrl
+            HostedZoneId:
+              Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::LoadBalancerCanonicalHostedZoneID
+          Name: !Sub web-pr-${PullRequestNumber}.${Namespace}.${Domain}
+          Type: A
+
+  PrivateALBRecordSet:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      Comment: Web application load balancer endpoint.
+      HostedZoneId:
+        Fn::ImportValue: !Sub "DNS::${Namespace}::PrivateHostedZoneId"
+      RecordSets:
+        - AliasTarget:
+            DNSName:
+              Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::LoadBalancerUrl
+            HostedZoneId:
+              Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::LoadBalancerCanonicalHostedZoneID
+          Name: !If
+            - HasHostHeader
+            - !Sub ${Namespace}.${HostHeader}
+            - !Sub ${AppCommit}.${Namespace}.${Domain}
+          Type: A
+
+  PullRequestPrivateALBRecordSet:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: HasPullRequestNumber
+    Properties:
+      Comment: Web application load balancer endpoint.
+      HostedZoneId:
+        Fn::ImportValue: !Sub DNS::${Namespace}::PrivateHostedZoneId
+      RecordSets:
+        - AliasTarget:
+            DNSName:
+              Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::LoadBalancerUrl
+            HostedZoneId:
+              Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::LoadBalancerCanonicalHostedZoneID
+          Name: !Sub web-pr-${PullRequestNumber}.${Namespace}.${Domain}
+          Type: A
+
+  ALBRulePriorityCustomResource:
+    Type: Custom::ALBRulePriority
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: !Sub Lambda::${DashCaseProjectName}-infra::ALBRulePriorityLambdaFunctionARN
+      ListenerArn:
+        Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::ALBListener
+
+  DemoALBRulePriorityCustomResource:
+    Type: Custom::ALBRulePriority
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: !Sub Lambda::${DashCaseProjectName}-infra::ALBRulePriorityLambdaFunctionARN
+      ListenerArn:
+        Fn::ImportValue: !Sub Service::${DashCaseProjectName}-infra::${Namespace}::${InfraGitBranch}::ALBListener

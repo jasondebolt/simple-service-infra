@@ -1,0 +1,167 @@
+
+Description: >
+  Deploys ECS infrastructure.
+
+Parameters:
+  DashCaseProjectName:
+    Description: The project name in hyphen-case.
+    Type: String
+
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+
+  Namespace:
+    Description: The namespace used for service discovery.
+    Type: String
+
+  InfraGitBranch:
+    Description: The infrastructure repo github branch that feeds into this pipeline.
+    Type: String
+
+  InfraGitCommit:
+    Description: The Infrastructure git repo commit associated with this stack.
+    Type: String
+
+  TemplateBucket:
+    Description: The S3 bucket name where CloudFormation templates can be found.
+    Type: String
+
+  ECSTemplatePath:
+    Description: The full folder/directory/path to ECS cloudformation templates excluding the template name.
+    Type: String
+
+  Scheme:
+    Description: The elastic load balancer scheme. Use 'internal' to keep within our firewalls, 'internet-facing' to expose load balancer to internet.
+    AllowedValues:
+      - internal
+      - internet-facing
+    Type: String
+    Default: internet-facing
+
+  OnDemandBaseCapacity:
+    Type: String
+    Description: The minimum amount of the Auto Scaling group's capacity that must be fulfilled by On-Demand Instances. This base portion is provisioned first as your group scales.
+    Default: 0
+
+  OnDemandPercentageAboveBaseCapacity:
+    Type: String
+    Description: >
+      Controls the percentages of On-Demand Instances and Spot Instances for your additional capacity beyond OnDemandBaseCapacity.
+      The range is 0–100. If you set this property to 100, the percentages are 100% for On-Demand Instances and 0% for Spot Instances.
+    Default: 10
+
+Mappings:
+  test:
+    test:
+      DesiredCapacity: 3
+      MinSize: 3
+      MaxSize: 25
+    devops:
+      DesiredCapacity: 2
+      MinSize: 0
+      MaxSize: 5
+
+Conditions:
+  IsInternalELB:
+    !Equals [!Ref Scheme, internal]
+  IsMasterBranch:
+    !Equals [!Ref InfraGitBranch, master]
+
+Resources:
+  SecurityGroups:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${TemplateBucket}/${InfraGitBranch}/${InfraGitCommit}/${ECSTemplatePath}/template-security-groups.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        Namespace: !Ref Namespace
+        GitHubBranch: !Ref InfraGitBranch
+        VPC:
+          Fn::ImportValue: !Sub "${EnvironmentName}-VPC"
+
+  ALB:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${TemplateBucket}/${InfraGitBranch}/${InfraGitCommit}/${ECSTemplatePath}/template-load-balancers.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        Namespace: !Ref Namespace
+        VPC:
+          Fn::ImportValue: !Sub "${EnvironmentName}-VPC"
+        Subnets:
+          !If [IsInternalELB, 'Fn::ImportValue': !Sub "${EnvironmentName}-PrivateSubnets", 'Fn::ImportValue': !Sub "${EnvironmentName}-PublicSubnets"]
+        SecurityGroup: !GetAtt SecurityGroups.Outputs.LoadBalancerSecurityGroupDebug
+        CertificateARN:
+          Fn::ImportValue: !Sub "DNS::${Namespace}::CertificateARN1"
+        Scheme: !Ref Scheme
+
+  ECS:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${TemplateBucket}/${InfraGitBranch}/${InfraGitCommit}/${ECSTemplatePath}/template-ecs-cluster.yaml
+      Parameters:
+        DashCaseProjectName: !Ref DashCaseProjectName
+        EnvironmentName: !Ref EnvironmentName
+        Namespace: !Ref Namespace
+        InstanceType: m5.xlarge
+        DesiredCapacity: !FindInMap [ !Ref EnvironmentName, !Ref Namespace, DesiredCapacity ]
+        MinSize: !FindInMap [ !Ref EnvironmentName, !Ref Namespace, MinSize ]
+        MaxSize: !FindInMap [ !Ref EnvironmentName, !Ref Namespace, MaxSize ]
+        KeyName: !Sub "${EnvironmentName}-${AWS::Region}-${AWS::AccountId}"
+        VPC:
+          Fn::ImportValue: !Sub "${EnvironmentName}-VPC"
+        SecurityGroup: !GetAtt SecurityGroups.Outputs.ECSHostSecurityGroup
+        Subnets:
+          Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnets
+        ClusterName: !Sub ${DashCaseProjectName}-${EnvironmentName}-${Namespace}-${InfraGitBranch}
+        OnDemandBaseCapacity: !Ref OnDemandBaseCapacity
+        OnDemandPercentageAboveBaseCapacity: !Ref OnDemandPercentageAboveBaseCapacity
+
+Outputs:
+  LoadBalancerUrl:
+    Description: The URL endpoint for the service
+    Value: !GetAtt ALB.Outputs.LoadBalancerUrl
+    Export:
+      Name: !Sub Service::${DashCaseProjectName}::${Namespace}::${InfraGitBranch}::LoadBalancerUrl
+
+  LoadBalancerName:
+    Description: The name of the load balancer
+    Value: !GetAtt ALB.Outputs.LoadBalancerName
+    Export:
+      Name: !Sub Service::${DashCaseProjectName}::${Namespace}::${InfraGitBranch}::LoadBalancerName
+
+  LoadBalancerUniqueID:
+    Description: |
+      A unique id parsed from the name of the load balancer. It's shorter than the load balancer name.
+      Can be used in the name of a target group to reassign a target group to a new load balancer
+      if the load balancer changes during stack updates.
+      This avoids the "You cannot associate a target group with more than one load balancer" issue.
+      If your load balancer name is 'demo1-LoadB-1PSH7PZC1PZ6Y', this would return '1PSH7PZC1PZ6Y'.
+    Value: !GetAtt ALB.Outputs.LoadBalancerUniqueID
+    Export:
+      Name: !Sub Service::${DashCaseProjectName}::${Namespace}::${InfraGitBranch}::LoadBalancerUniqueID
+
+  LoadBalancerCanonicalHostedZoneID:
+    Description: The canonical hosted zone ID of the load balancer.
+    Value: !GetAtt ALB.Outputs.LoadBalancerCanonicalHostedZoneID
+    Export:
+      Name: !Sub Service::${DashCaseProjectName}::${Namespace}::${InfraGitBranch}::LoadBalancerCanonicalHostedZoneID
+
+  Cluster:
+    Description: The service ECS cluster
+    Value: !GetAtt ECS.Outputs.Cluster
+    Export:
+      Name: !Sub Service::${DashCaseProjectName}::${Namespace}::${InfraGitBranch}::Cluster
+
+  ALBListener:
+    Description: The service ALB listener
+    Value: !GetAtt ALB.Outputs.Listener
+    Export:
+      Name: !Sub Service::${DashCaseProjectName}::${Namespace}::${InfraGitBranch}::ALBListener
+
+  ECSHostSecurityGroup:
+    Description: The service ECS Host SecurityGroup
+    Value: !GetAtt SecurityGroups.Outputs.ECSHostSecurityGroup
+    Export:
+      Name: !Sub Service::${DashCaseProjectName}::${Namespace}::${InfraGitBranch}::ECSHostSecurityGroup

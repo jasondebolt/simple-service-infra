@@ -1,0 +1,30 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      docker: 18
+      python: 3.8
+  pre_build:
+    commands:
+      - # If this is a pull request, report to the GitHub pull request that we are staring the build.
+      - pwd && ls -ltra && env # Useful for debugging
+      # - aws --version
+      - $(aws ecr get-login --no-include-email)
+      - IMAGE_TAG=v_$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+  build:
+    commands:
+      - # End
+  post_build:
+    commands:
+      - python $CODEBUILD_SRC_DIR/buildspecs/pull_request.py statuses InfrastructureDocker completed "Builds Docker Images" codebuild_url
+      - # Save the image tag to a file to be exported as an artifact to be imported later by a CloudFormation stack action in the pipeline.
+      - printf '{"ImageTag":"%s","InfraGitCommit":"%s"}\n' $IMAGE_TAG $CODEBUILD_RESOLVED_SOURCE_VERSION > $CODEBUILD_SRC_DIR/docker_infra_output.json
+      - # Check build status
+      - bash -c "if [ /"$CODEBUILD_BUILD_SUCCEEDING/" == /"0/" ]; then exit 1; fi"
+      - echo Build successfully completed on `date`
+      - python $CODEBUILD_SRC_DIR/buildspecs/pull_request.py statuses InfrastructureDocker completed "Builds Docker Images" codebuild_url
+artifacts:
+  files:
+    - docker_infra_output.json
+  discard-paths: yes

@@ -1,0 +1,54 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      docker: 18
+      python: 3.8
+  pre_build:
+    commands:
+      - # If this is a pull request, report to the GitHub pull request that we are staring the build.
+      - pwd && ls -ltra && env # Useful for debugging
+      - aws --version
+      - INFRA_GIT_COMMIT=$CODEBUILD_RESOLVED_SOURCE_VERSION
+      - GIT_COMMIT=$INFRA_GIT_COMMIT
+      - CODEPIPELINE_EXECUTION_ID=$(aws codepipeline get-pipeline-state --region $AWS_DEFAULT_REGION --name $PIPELINE_NAME --query 'stageStates[?actionStates[?latestExecution.externalExecutionId==`'${CODEBUILD_BUILD_ID}'`]].latestExecution.pipelineExecutionId' --output text)
+      - # Pip installs
+      - pip install aws-sam-cli
+  build:
+    commands:
+      - python $CODEBUILD_SRC_DIR/buildspecs/pull_request.py statuses CloudFormationValidation pending "Validates CloudFormation Templates" codebuild_url
+      - # Validate all cloudformation templates in templates dir.
+      - . $CODEBUILD_SRC_DIR/templates/validate.sh
+      - # SAM packaging
+      - for app in $(ls $CODEBUILD_SRC_DIR/sam); do cd $CODEBUILD_SRC_DIR/sam/${app} && sam build && sam package --s3-bucket $LAMBDA_BUCKET_NAME > template-sam-${app}.yaml; done
+      - # The next two lines will copy all cloudformation templates from the git repo, including in all subdirectories, to S3.
+      - aws s3 cp $CODEBUILD_SRC_DIR s3://$TEMPLATE_BUCKET/$GIT_BRANCH/$INFRA_GIT_COMMIT/ --recursive --exclude "*" --include "*template-*.yaml"
+      - aws s3 cp $CODEBUILD_SRC_DIR s3://$TEMPLATE_BUCKET/$GIT_BRANCH/latest/ --recursive --exclude "*" --include "*template-*.yaml"
+  post_build:
+    commands:
+      - # Save the build output file to be exported as an artifact to be imported later by a CloudFormation stack action in the pipeline.
+      - printf '{"InfraGitCommit":"%s", "CodePipelineExecutionId":"%s"}\n' $INFRA_GIT_COMMIT $CODEPIPELINE_EXECUTION_ID > $CODEBUILD_SRC_DIR/build_output.json
+      - # Save the github webhook configuration file
+      - python $CODEBUILD_SRC_DIR/buildspecs/config_helper.py config_deps # Writes to 'config_deps.json'
+      - # Save the project API configuration file
+      - python $CODEBUILD_SRC_DIR/buildspecs/config_helper.py config_api # Writes to 'config_api.json'
+      - # Check build status
+      - bash -c "if [ /"$CODEBUILD_BUILD_SUCCEEDING/" == /"0/" ]; then exit 1; fi"
+      - echo Build successfully completed on `date`
+      - python $CODEBUILD_SRC_DIR/buildspecs/pull_request.py statuses CloudFormationValidation completed "Validates CloudFormation Templates" codebuild_url
+artifacts:
+  files:
+    - # Configs
+    - build_output.json
+    - config*.json
+    - # CloudFormation templates.
+    - templates/*/template-*.yaml
+    - templates/*/*/template-*.yaml
+    - templates/*/*/*/template-*.yaml
+    - templates/*.json
+    - # SAM templates.
+    - sam/*/template-*.yaml
+    - sam/*/*/template-*.yaml
+    - sam/*/*/*/template-*.yaml
+    - sam/*.json

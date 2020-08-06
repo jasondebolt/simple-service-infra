@@ -1,0 +1,121 @@
+Description: >
+  Deploys an Application Load Balancer.
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+
+  Namespace:
+    Description: The namespace used for service discovery.
+    Type: String
+
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: Choose which VPC the Application Load Balancer should be deployed to
+
+  Subnets:
+    Description: Choose which subnets the Application Load Balancer should be deployed to
+    Type: List<AWS::EC2::Subnet::Id>
+
+  SecurityGroup:
+    Description: Select the Security Group to apply to the Application Load Balancer
+    Type: AWS::EC2::SecurityGroup::Id
+
+  CertificateARN:
+    Description: The AWS ACM/SSL/TLS certificate ARN to associate with the load balancer(s).
+    Type: String
+
+  Scheme:
+    Description: The elastic load balancer scheme. Use 'internal' to keep within our firewalls, 'internet-facing' to expose load balancer to internet.
+    AllowedValues:
+      - internal
+      - internet-facing
+    Type: String
+
+Conditions:
+  IsInternalELB:
+    !Equals [!Ref Scheme, internal]
+
+Resources:
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets: !Ref Subnets
+      Scheme: !Ref Scheme
+      SecurityGroups:
+        - !Ref SecurityGroup
+      Tags:
+        - Key: NamespaceName
+          Value: !Sub ${Namespace}
+        - Key: EnvironmentName
+          Value: !Sub ${EnvironmentName}
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !Ref CertificateARN
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DefaultTargetGroup
+
+  # Redirect HTTP to HTTPS
+  LoadBalancerListenerRedirectHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Host: "#{host}"
+            Port: 443
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+
+  # We define a default target group here, as this is a mandatory Parameters
+  # when creating an Application Load Balancer Listener. This is not used, instead
+  # a target group is created per-service in each service template (../services/*)
+  DefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+
+Outputs:
+  LoadBalancer:
+    Description: A reference to the Application Load Balancer
+    Value: !Ref LoadBalancer
+
+  LoadBalancerUrl:
+    Description: The URL of the ALB
+    Value: !GetAtt LoadBalancer.DNSName
+
+  LoadBalancerName:
+    Description: The name of the ALB
+    Value: !GetAtt LoadBalancer.LoadBalancerName
+
+  LoadBalancerUniqueID:
+    Description: |
+      A unique id parsed from the name of the load balancer. It's shorter than the load balancer name.
+      Can be used in the name of a target group to reassign a target group to a new load balancer
+      if the load balancer changes during stack updates.
+      This avoids the "You cannot associate a target group with more than one load balancer" issue.
+      If your load balancer name is 'demo1-LoadB-1PSH7PZC1PZ6Y', this would return '1PSH7PZC1PZ6Y'.
+    Value: !Select [ 2, !Split [ '-', !GetAtt LoadBalancer.LoadBalancerName]]
+
+  LoadBalancerCanonicalHostedZoneID:
+    Description: The CanonicalHostedZoneID of the ALB
+    Value: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+  Listener:
+    Description: The load balancer listener
+    Value: !Ref LoadBalancerListener

@@ -1,0 +1,32 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      docker: 18
+      python: 3.8
+    commands:
+      - # Install jq 1.6
+      - wget -O /usr/bin/jq https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 && chmod 755 /usr/bin/jq
+  pre_build:
+    commands:
+      - pwd && ls -ltra && env # Useful for debugging
+      # - aws --version
+      - $(aws ecr get-login --no-include-email)
+      - APP_DIR=$CODEBUILD_SRC_DIR_App
+      - CODEPIPELINE_EXECUTION_ID=$(aws codepipeline get-pipeline-state --region $AWS_DEFAULT_REGION --name $PIPELINE_NAME --query 'stageStates[?actionStates[?latestExecution.externalExecutionId==`'${CODEBUILD_BUILD_ID}'`]].latestExecution.pipelineExecutionId' --output text)
+      - echo CODEPIPELINE_EXECUTION_ID=$CODEPIPELINE_EXECUTION_ID
+      - PIPELINE_EXECUTIONS=$(aws codepipeline list-pipeline-executions --pipeline-name $PIPELINE_NAME --query 'pipelineExecutionSummaries[?pipelineExecutionId==`'${CODEPIPELINE_EXECUTION_ID}'`]')
+      - echo $PIPELINE_EXECUTIONS
+      - APP_COMMIT=$(echo $PIPELINE_EXECUTIONS | tr '\r\n' ' ' | jq '.[].sourceRevisions[] | select(.actionName=="App").revisionId' --raw-output)
+      - INFRA_COMMIT=$(echo $PIPELINE_EXECUTIONS | tr '\r\n' ' ' | jq '.[].sourceRevisions[] | select(.actionName=="Infra").revisionId' --raw-output)
+      - VERSION_ID=v_$(echo $APP_COMMIT | cut -c 1-7)
+  build:
+    commands:
+      - echo notifying github...
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - python $CODEBUILD_SRC_DIR/buildspecs/pull_request.py statuses ECSWebLogsURL completed "ECS Web Logs URL" ecs_web_logs_url
+      - python $CODEBUILD_SRC_DIR/buildspecs/pull_request.py statuses DeploymentURL completed "ECS/Docker URL that gets replaced on every commit" ecs_url
+      - python $CODEBUILD_SRC_DIR/buildspecs/pull_request.py statuses DemoURL completed "ECS/Docker URL for sharing with others (lives across commits)" demo_url

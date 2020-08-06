@@ -1,0 +1,115 @@
+Description: >
+  Deploys security groups.
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+
+  Namespace:
+    Description: The namespace used for service discovery.
+    Type: String
+
+  GitHubBranch:
+    Type: String
+
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: Choose which VPC the security groups should be deployed to
+
+Resources:
+  # SECURITY GROUPS
+  ECSHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Access to the ECS hosts and the tasks/containers that run on them
+      Tags:
+        - Key: Name
+          Value: !Sub ${Namespace}-${GitHubBranch}-ECS-Hosts
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Restricts only HTTPS traffic to an ELB.
+      Tags:
+        - Key: Name
+          Value: !Sub ${Namespace}-${GitHubBranch}-LoadBalancers
+
+  LoadBalancerSecurityGroupDebug:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Allows HTTP, HTTPS, and other types of traffic to an ELB.
+      Tags:
+        - Key: Name
+          Value: !Sub ${Namespace}-{GitHubBranch}-LoadBalancers
+
+  # INGRESS RULES
+  ECSHostToECSHost:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      FromPort: -1
+      ToPort: -1
+      GroupId: !Ref ECSHostSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref ECSHostSecurityGroup
+
+  LoadBalancerToECSHost:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      FromPort: -1
+      ToPort: -1
+      GroupId: !Ref ECSHostSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  LoadBalancerDebugToECSHost:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      FromPort: -1
+      ToPort: -1
+      GroupId: !Ref ECSHostSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroupDebug
+
+  HTTPToLoadBalancerDebug:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      CidrIp: 0.0.0.0/0
+      FromPort: 80
+      ToPort: 80
+      GroupId: !Ref LoadBalancerSecurityGroupDebug
+      IpProtocol: tcp
+
+  HTTPSToLoadBalancerDebug:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      CidrIp: 0.0.0.0/0
+      FromPort: 443
+      ToPort: 443
+      GroupId: !Ref LoadBalancerSecurityGroupDebug
+      IpProtocol: tcp
+
+  HTTPSToLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      CidrIp: 0.0.0.0/0
+      FromPort: 443
+      ToPort: 443
+      GroupId: !Ref LoadBalancerSecurityGroup
+      IpProtocol: tcp
+
+Outputs:
+  ECSHostSecurityGroup:
+    Description: A reference to the security group for ECS hosts
+    Value: !Ref ECSHostSecurityGroup
+
+  LoadBalancerSecurityGroup:
+    Description: A reference to the security group for load balancers
+    Value: !Ref LoadBalancerSecurityGroup
+
+  LoadBalancerSecurityGroupDebug:
+    Description: A reference to the security group for load balancers
+    Value: !Ref LoadBalancerSecurityGroupDebug

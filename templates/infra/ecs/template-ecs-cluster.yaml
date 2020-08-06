@@ -1,0 +1,394 @@
+Description: >
+  Deploys an ECS cluster.
+
+Parameters:
+  DashCaseProjectName:
+    Description: The project name in hyphen-case.
+    Type: String
+
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String
+
+  Namespace:
+    Description: The namespace used for service discovery.
+    Type: String
+
+  InstanceType:
+    Description: Which instance type should we use to build the ECS cluster?
+    Type: String
+    Default: c4.large
+
+  MinSize:
+    Description: Min ECS hosts do you want to deploy?
+    Type: Number
+    Default: 1
+
+  MaxSize:
+    Description: Max ECS hosts do you want to deploy?
+    Type: Number
+    Default: 2
+
+  DesiredCapacity:
+    Description: How many ECS hosts do you want to initially deploy?
+    Type: Number
+    Default: 1
+
+  VPC:
+    Description: Choose which VPC this ECS cluster should be deployed to
+    Type: AWS::EC2::VPC::Id
+
+  Subnets:
+    Description: Choose which subnets this ECS cluster should be deployed to
+    Type: List<AWS::EC2::Subnet::Id>
+
+  KeyName:
+    Description: The SSH key name to access the instances.
+    Type: AWS::EC2::KeyPair::KeyName
+
+  SecurityGroup:
+    Description: Select the Security Group to use for the ECS cluster hosts
+    Type: AWS::EC2::SecurityGroup::Id
+
+  ECSAMI:
+    Description: ECS-Optimized AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux/recommended/image_id
+
+  ClusterName:
+    Type: String
+    Description: The ECS cluster name
+
+  OnDemandBaseCapacity:
+    Type: String
+    Description: The minimum amount of the Auto Scaling group's capacity that must be fulfilled by On-Demand Instances. This base portion is provisioned first as your group scales.
+    Default: 0
+
+  OnDemandPercentageAboveBaseCapacity:
+    Type: String
+    Description: >
+      Controls the percentages of On-Demand Instances and Spot Instances for your additional capacity beyond OnDemandBaseCapacity.
+      The range is 0–100. If you set this property to 100, the percentages are 100% for On-Demand Instances and 0% for Spot Instances.
+    Default: 10
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+
+  ECSAutoScalingGroupSpot:
+    DependsOn: ECSCluster
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref Subnets
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      MetricsCollection:
+        - Granularity: 1Minute
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          # The minimum amount of the Auto Scaling group's capacity that must be fulfilled by On-Demand Instances. This base portion is provisioned first as your group scales.
+          # If you leave this property set to 0, On-Demand Instances are launched as a percentage of the Auto Scaling group's desired capacity, per the OnDemandPercentageAboveBaseCapacity setting.
+          OnDemandBaseCapacity: !Ref OnDemandBaseCapacity
+          # Controls the percentages of On-Demand Instances and Spot Instances for your additional capacity beyond OnDemandBaseCapacity.
+          # The range is 0–100. The default value is 100. If you leave this property set to 100, the percentages are 100% for On-Demand Instances and 0% for Spot Instances.
+          # See https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-autoscaling-autoscalinggroup-instancesdistribution.html
+          # Jason Note --> Leave a small % of on-demand instances so we can still scale up/down based on cluster memory reservation.
+          OnDemandPercentageAboveBaseCapacity: !Ref OnDemandPercentageAboveBaseCapacity
+          # Indicates how to allocate Spot capacity across Spot pools.
+          # If the allocation strategy is lowest-price, the Auto Scaling group launches instances using the Spot pools with the lowest price, and evenly allocates your instances across the number of
+          # Spot pools that you specify. If the allocation strategy is capacity-optimized, the Auto Scaling group launches instances using Spot pools that are optimally chosen based on the available Spot capacity.
+          SpotAllocationStrategy: lowest-price
+          # The number of Spot pools to use to allocate your Spot capacity. The Spot pools are determined from the different instance types in the
+          # Overrides array of LaunchTemplate. The range is 1–20. The default value is 2.
+          SpotInstancePools: 2
+          # The maximum price per unit hour that you are willing to pay for a Spot Instance. If you leave the value of this property blank (which is the default), the maximum Spot price is set at the On-Demand price.
+          # SpotMaxPrice: String
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref ECSLaunchTemplate
+            # The version number. AWS CloudFormation does not support specifying $Latest, or $Default for the template version number.
+            # Minimum: 1, Maximum: 255
+            Version: 1
+      Tags:
+        - Key: Name
+          Value: !Sub ${Namespace} ECS mixed instance host
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT1M
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: true
+
+  ECSLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ECSAMI
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        IamInstanceProfile:
+          Arn:
+            Fn::ImportValue: !Sub ${DashCaseProjectName}-ecs-instance-profile-arn
+
+        UserData:
+          "Fn::Base64": !Sub |
+            #!/bin/bash
+            yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+            yum install -y https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            yum install -y aws-cfn-bootstrap hibagent
+            /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSLaunchTemplate
+            /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSAutoScalingGroupSpot
+            /usr/bin/enable-ec2-spot-hibernation
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              collectd: []
+
+          commands:
+            01_add_instance_to_cluster:
+              command: !Sub echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            02_enable_cloudwatch_agent:
+              command: !Sub /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${ECSCloudWatchParameter} -s
+          files:
+            /etc/cfn/cfn-hup.conf:
+              mode: 000400
+              owner: root
+              group: root
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ECSLaunchTemplate.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSLaunchTemplate
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+
+  ECSCloudWatchAlarmHighMemoryReservationSpot:
+    # Triggers an alarm if the ECS cluster exceeds a specific memory threshold across all services in the cluster.
+    # This alarm can be used to add more EC2 instances to the ECS cluster.
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: true
+      Namespace: AWS/ECS
+      MetricName: MemoryReservation
+      # The statistic for the metric associated with the alarm, other than percentile. For percentile statistics, use ExtendedStatistic.
+      # Average | Maximum | Minimum | SampleCount | Sum
+      Statistic: Average
+      ComparisonOperator: GreaterThanThreshold
+      # The number of periods over which data is compared to the specified threshold.
+      EvaluationPeriods: 1
+      #                               (Total MiB of memory reserved by tasks in cluster x 100)
+      # Cluster memory reservation =  ------------------------------------------------------------------
+      #                               (Total MiB of memory registered by container instances in cluster)
+      Threshold: 65
+      Period: 300 # Seconds
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      # The number of datapoints that must be breaching to trigger the alarm. This is used only if you are setting
+      # an "M out of N" alarm. In that case, this value is the M. For more information, see Evaluating an Alarm
+      # in the Amazon CloudWatch User Guide.
+      DatapointsToAlarm: 1
+      # Sets how this alarm is to handle missing data points. Valid values are breaching, notBreaching, ignore, and missing.
+      TreatMissingData: missing
+      AlarmActions:
+        - !Ref ECSAutoScalingGroupScaleUpSpot # Returns ARN of scaling policy
+
+  ECSAutoScalingGroupScaleUpSpot:
+    # Adds EC2 instances to the ECS cluster if the alarm is triggered.
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ECSAutoScalingGroupSpot
+      PolicyType: SimpleScaling
+      # The amount of time, in seconds, after a scaling activity completes before any further dynamic
+      # scaling activities can start. If this property is not specified, the default cooldown period for the group applies.
+      # Valid only if the policy type is SimpleScaling.
+      Cooldown: 300
+      # Specifies whether the ScalingAdjustment property is an absolute number or a percentage of the current capacity.
+      # The valid values are ChangeInCapacity, ExactCapacity, and PercentChangeInCapacity.
+      AdjustmentType: ChangeInCapacity
+      # A set of adjustments that enable you to scale based on the size of the alarm breach.
+      ScalingAdjustment: 2 # Number of EC2 instances to add.
+
+  ECSCloudWatchAlarmLowMemoryReservationSpot:
+    # Triggers an alarm if the ECS cluster drops below a specific memory threshold across all services in the cluster.
+    # This alarm can be used to remove EC2 instances from the ECS cluster.
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: true
+      Namespace: AWS/ECS
+      MetricName: MemoryReservation
+      Statistic: Average
+      ComparisonOperator: LessThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Threshold: 30
+      Period: 300 # Seconds
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      DatapointsToAlarm: 1
+      TreatMissingData: missing
+      AlarmActions:
+        - !Ref ECSAutoScalingGroupScaleDownSpot # Returns ARN of scaling policy
+
+  ECSAutoScalingGroupScaleDownSpot:
+    # Removes EC2 instances from the ECS cluster if the alarm is triggered.
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ECSAutoScalingGroupSpot
+      PolicyType: SimpleScaling
+      Cooldown: 10 # Wait 10 seconds for faster scale downs.
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1 # Number of EC2 instances to remove.
+
+  ECSServiceAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Action:
+            - "sts:AssumeRole"
+          Effect: Allow
+          Principal:
+            Service:
+              - application-autoscaling.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: ecs-service-autoscaling
+          PolicyDocument:
+            Statement:
+              Effect: Allow
+              Action:
+                - application-autoscaling:*
+                - cloudwatch:DescribeAlarms
+                - cloudwatch:PutMetricAlarm
+                - ecs:DescribeServices
+                - ecs:UpdateService
+              Resource: "*"
+
+  ECSCloudWatchParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: ECS
+      Name: !Sub "AmazonCloudWatch-${ECSCluster}-ECS"
+      Type: String
+      Value: !Sub |
+        {
+          "logs": {
+            "force_flush_interval": 5,
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/messages",
+                    "log_group_name": "${ECSCluster}-/var/log/messages",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%b %d %H:%M:%S"
+                  },
+                  {
+                    "file_path": "/var/log/dmesg",
+                    "log_group_name": "${ECSCluster}-/var/log/dmesg",
+                    "log_stream_name": "{instance_id}"
+                  },
+                  {
+                    "file_path": "/var/log/docker",
+                    "log_group_name": "${ECSCluster}-/var/log/docker",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%S.%f"
+                  },
+                  {
+                    "file_path": "/var/log/ecs/ecs-init.log",
+                    "log_group_name": "${ECSCluster}-/var/log/ecs/ecs-init.log",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
+                  },
+                  {
+                    "file_path": "/var/log/ecs/ecs-agent.log.*",
+                    "log_group_name": "${ECSCluster}-/var/log/ecs/ecs-agent.log",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
+                  },
+                  {
+                    "file_path": "/var/log/ecs/audit.log",
+                    "log_group_name": "${ECSCluster}-/var/log/ecs/audit.log",
+                    "log_stream_name": "{instance_id}",
+                    "timestamp_format": "%Y-%m-%dT%H:%M:%SZ"
+                  }
+                ]
+              }
+            }
+          },
+          "metrics": {
+            "append_dimensions": {
+              "AutoScalingGroupName": "${!aws:AutoScalingGroupName}",
+              "InstanceId": "${!aws:InstanceId}",
+              "InstanceType": "${!aws:InstanceType}"
+            },
+            "metrics_collected": {
+              "collectd": {
+                "metrics_aggregation_interval": 60
+              },
+              "disk": {
+                "measurement": [
+                  "used_percent"
+                ],
+                "metrics_collection_interval": 60,
+                "resources": [
+                  "/"
+                ]
+              },
+              "mem": {
+                "measurement": [
+                  "mem_used_percent"
+                ],
+                "metrics_collection_interval": 60
+              },
+              "statsd": {
+                "metrics_aggregation_interval": 60,
+                "metrics_collection_interval": 10,
+                "service_address": ":8125"
+              }
+            }
+          }
+        }
+Outputs:
+  Cluster:
+    Description: A reference to the ECS cluster
+    Value: !Ref ECSCluster
+
+  ECSServiceAutoScalingRole:
+    Description: A reference to ECS service auto scaling role
+    Value: !GetAtt ECSServiceAutoScalingRole.Arn
+
+  ECSAutoScalingGroupNameSpot:
+    Description: A reference to ECS AutoScaling Group Name
+    Value: !Ref ECSAutoScalingGroupSpot
